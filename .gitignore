@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Testing
+.pytest_cache/
+.ipynb_checkpoints/
+.coverage
+.tox/
+htmlcov/
+*.log
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Claude Code and AI tools
+.claude/
+.codex/
+.windsurf/
+
+# Project-specific
+openspec/
+AGENTS.md
+CLAUDE.md
+OPENSPEC.md
+
+# PDFs and text files (research papers)
+*.pdf
+*.txt

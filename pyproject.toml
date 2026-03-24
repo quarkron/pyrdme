@@ -53,11 +53,7 @@ all = [
     "pyrdme[viz,analysis,gpu,dev]",
 ]
 
-[project.urls]
-Homepage = "https://github.com/Munroe-Meyer-Institute-VR-Laboratory/pyrdme"
-Documentation = "https://github.com/Munroe-Meyer-Institute-VR-Laboratory/pyrdme#readme"
-Repository = "https://github.com/Munroe-Meyer-Institute-VR-Laboratory/pyrdme"
-Issues = "https://github.com/Munroe-Meyer-Institute-VR-Laboratory/pyrdme/issues"
+
 
 [tool.setuptools.packages.find]
 where = ["."]

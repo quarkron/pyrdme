@@ -58,6 +58,9 @@ from .solvers import DiffusionSolver, MPDSolver, validate_timestep
 # Simulation functions
 from .simulate import simulate_rdme, simulate_diffusion_only, RDMEResult
 
+# Ensemble
+from .ensemble import run_ensemble, make_param_grid
+
 # Re-export from pycme for convenience
 from pycme import Reaction, get_all_species
 
@@ -76,6 +79,10 @@ __all__ = [
     'simulate_rdme',
     'simulate_diffusion_only',
     'RDMEResult',
+
+    # Ensemble
+    'run_ensemble',
+    'make_param_grid',
 
     # Utilities
     'validate_timestep',

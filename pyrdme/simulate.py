@@ -6,7 +6,7 @@ reaction-diffusion simulation and records results.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Literal
+from typing import Dict, List, Optional, Literal, Union
 import numpy as np
 
 from .lattice import Lattice2D
@@ -46,6 +46,7 @@ class RDMEResult:
     species: List[str]
     shape: tuple
     spacing: float
+    resource_history: Dict[str, list] = field(default_factory=dict)
 
     def get_snapshot(self, time: float) -> Lattice2D:
         """
@@ -188,6 +189,9 @@ def simulate_rdme(
     record_every: Optional[float] = None,
     seed: Optional[int] = None,
     backend: BackendType = 'auto',
+    reaction_sites: Optional[Dict[int, Union[str, List[str]]]] = None,
+    global_resources: Optional[Dict[str, int]] = None,
+    reaction_costs: Optional[Dict[int, Dict[str, int]]] = None,
 ) -> RDMEResult:
     """
     Run a reaction-diffusion master equation simulation.
@@ -259,7 +263,12 @@ def simulate_rdme(
     sim_lattice = lattice.copy()
 
     # Create solver
-    solver = MPDSolver(sim_lattice, reactions, diffusion, seed=seed)
+    solver = MPDSolver(
+        sim_lattice, reactions, diffusion, seed=seed,
+        reaction_sites=reaction_sites,
+        global_resources=global_resources,
+        reaction_costs=reaction_costs,
+    )
 
     # Determine timestep
     max_dt = solver.get_max_timestep()
@@ -279,6 +288,12 @@ def simulate_rdme(
     times = [0.0]
     snapshots = [sim_lattice.copy()]
 
+    # Initialize resource history tracking
+    resource_history: Dict[str, list] = {}
+    if solver.global_resources:
+        for name, val in solver.global_resources.items():
+            resource_history[name] = [val]
+
     # Run simulation
     t = 0.0
     next_record_time = record_interval
@@ -295,6 +310,8 @@ def simulate_rdme(
         if t >= next_record_time - 1e-12 or t >= t_max - 1e-12:
             times.append(t)
             snapshots.append(sim_lattice.copy())
+            for name in resource_history:
+                resource_history[name].append(solver.global_resources[name])
             next_record_time += record_interval
 
     return RDMEResult(
@@ -303,6 +320,7 @@ def simulate_rdme(
         species=list(lattice.species),
         shape=lattice.shape,
         spacing=lattice.spacing,
+        resource_history=resource_history,
     )
 
 

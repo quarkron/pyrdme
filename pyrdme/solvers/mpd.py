@@ -26,7 +26,7 @@ Propensity Formulas
 | A + A → products   | a = k·nₐ·(nₐ-1)/2    |
 """
 
-from typing import List, Optional
+from typing import Dict, List, Optional, Union
 import numpy as np
 
 from ..lattice import Lattice2D
@@ -35,6 +35,8 @@ from .diffusion import validate_timestep
 
 # Import Reaction from pycme
 from pycme import Reaction
+
+from ._numba_kernels import HAS_NUMBA, _apply_stoichiometry_numba
 
 
 class MPDSolver(RDMESolver):
@@ -82,6 +84,9 @@ class MPDSolver(RDMESolver):
         reactions: List[Reaction],
         diffusion: DiffusionSpec,
         seed: Optional[int] = None,
+        reaction_sites: Optional[Dict[int, Union[str, List[str]]]] = None,
+        global_resources: Optional[Dict[str, int]] = None,
+        reaction_costs: Optional[Dict[int, Dict[str, int]]] = None,
     ):
         super().__init__(lattice, diffusion, seed)
         self.reactions = reactions
@@ -93,6 +98,17 @@ class MPDSolver(RDMESolver):
         # Shape: (n_reactions, n_species)
         self._stoichiometry = self._build_stoichiometry_matrix()
 
+        # Site-gated reactions: precompute masks
+        self._reaction_masks = self._build_reaction_masks(reaction_sites)
+
+        # Global resource counters
+        self.global_resources = dict(global_resources) if global_resources else {}
+        self._reaction_costs = dict(reaction_costs) if reaction_costs else {}
+
+        # Precompute reactant index arrays for Numba kernels
+        self._reactant_indices_flat, self._reactant_stoich_flat, self._reactant_offsets = \
+            self._build_reactant_arrays()
+
     def _validate_reactions(self) -> None:
         """Validate that all reaction species exist in the lattice."""
         lattice_species = set(self.lattice.species)
@@ -103,6 +119,44 @@ class MPDSolver(RDMESolver):
                         f"Species '{species}' in reaction '{rxn}' "
                         f"not found in lattice species: {self.lattice.species}"
                     )
+
+    def _build_reaction_masks(
+        self,
+        reaction_sites: Optional[Dict[int, Union[str, List[str]]]] = None,
+    ) -> np.ndarray:
+        """
+        Build site-type masks for each reaction.
+
+        Returns
+        -------
+        np.ndarray
+            Shape (n_reactions, nx, ny) float64 masks (1.0 or 0.0).
+        """
+        nx, ny = self.lattice.nx, self.lattice.ny
+        n_reactions = len(self.reactions)
+        masks = np.ones((n_reactions, nx, ny), dtype=np.float64)
+
+        if not reaction_sites:
+            return masks
+
+        # Validate: site types must be configured on lattice
+        if self.lattice.site_types is None:
+            raise ValueError(
+                "reaction_sites requires lattice site types to be configured "
+                "via lattice.set_site_type()"
+            )
+
+        for r_idx, site_constraint in reaction_sites.items():
+            if isinstance(site_constraint, str):
+                site_constraint = [site_constraint]
+
+            mask = np.zeros((nx, ny), dtype=np.float64)
+            for st in site_constraint:
+                type_id = self.lattice.site_type_id(st)
+                mask[self.lattice.site_types == type_id] = 1.0
+            masks[r_idx] = mask
+
+        return masks
 
     def _build_stoichiometry_matrix(self) -> np.ndarray:
         """
@@ -127,6 +181,41 @@ class MPDSolver(RDMESolver):
                 S[r, s] += 1
 
         return S
+
+    def _build_reactant_arrays(self):
+        """Build flattened reactant index/stoich arrays for Numba kernels."""
+        from collections import Counter
+        indices = []
+        stoichs = []
+        offsets = [0]
+
+        for rxn in self.reactions:
+            reactant_counts = Counter(rxn.reactants)
+            for species, stoich in reactant_counts.items():
+                indices.append(self.lattice.species_index(species))
+                stoichs.append(stoich)
+            offsets.append(len(indices))
+
+        return (
+            np.array(indices, dtype=np.int32),
+            np.array(stoichs, dtype=np.int32),
+            np.array(offsets, dtype=np.int32),
+        )
+
+    def warmup(self) -> None:
+        """Trigger Numba JIT compilation on small dummy arrays."""
+        if not HAS_NUMBA or not self.reactions:
+            return
+        n_species = len(self.lattice.species)
+        n_reactions = len(self.reactions)
+        dummy_counts = np.ones((n_species, 2, 2), dtype=np.int32)
+        dummy_firings = np.ones((n_reactions, 2, 2), dtype=np.int32)
+        dummy_stoich = self._stoichiometry.copy()
+        _apply_stoichiometry_numba(
+            dummy_counts, dummy_stoich, dummy_firings,
+            self._reactant_indices_flat, self._reactant_stoich_flat,
+            self._reactant_offsets,
+        )
 
     def get_max_timestep(self) -> float:
         """
@@ -202,26 +291,90 @@ class MPDSolver(RDMESolver):
         # Shape: (n_reactions, nx, ny)
         propensities = self._compute_propensities()
 
+        # Gate by depleted global resources: zero out propensities for
+        # reactions whose required resource is at zero
+        if self._reaction_costs and self.global_resources:
+            for r_idx, costs in self._reaction_costs.items():
+                for resource, _cost in costs.items():
+                    if self.global_resources.get(resource, 0) <= 0:
+                        propensities[r_idx] = 0.0
+
         # Sample number of reaction firings at each site
         # Shape: (n_reactions, nx, ny)
-        n_firings = self.rng.poisson(propensities * dt)
+        n_firings = self.rng.poisson(propensities * dt).astype(np.int32)
 
-        # Apply stoichiometry changes, limiting firings to available reactants
-        # For each reaction, update all species counts
-        for r in range(n_reactions):
-            firings_r = n_firings[r, :, :].copy()  # Shape: (nx, ny)
+        if HAS_NUMBA and n_reactions > 0:
+            # JIT path: limit firings and apply stoichiometry in compiled code
+            _apply_stoichiometry_numba(
+                self.lattice.counts, self._stoichiometry, n_firings,
+                self._reactant_indices_flat, self._reactant_stoich_flat,
+                self._reactant_offsets,
+            )
+        else:
+            # Pure-NumPy path
+            for r in range(n_reactions):
+                firings_r = n_firings[r, :, :].copy()
 
-            # Skip if no firings
-            if np.sum(firings_r) == 0:
+                if np.sum(firings_r) == 0:
+                    continue
+
+                firings_r = self._limit_firings(r, firings_r)
+                n_firings[r, :, :] = firings_r
+
+                for s, delta in enumerate(self._stoichiometry[r, :]):
+                    if delta != 0:
+                        self.lattice.counts[s, :, :] += delta * firings_r
+
+        # Consume global resources with proportional limiting
+        if self._reaction_costs and self.global_resources:
+            self._consume_resources(n_firings)
+
+    def _consume_resources(self, n_firings: np.ndarray) -> None:
+        """
+        Consume global resources based on reaction firings.
+
+        If total cost exceeds available resource, scale firings proportionally
+        (floor) and revert excess stoichiometry changes.
+        """
+        # Group reactions by resource
+        resource_reactions: Dict[str, list] = {}
+        for r_idx, costs in self._reaction_costs.items():
+            for resource, cost in costs.items():
+                if resource not in resource_reactions:
+                    resource_reactions[resource] = []
+                resource_reactions[resource].append((r_idx, cost))
+
+        for resource, rxn_costs in resource_reactions.items():
+            available = self.global_resources.get(resource, 0)
+            if available <= 0:
                 continue
 
-            # Limit firings based on available reactants
-            firings_r = self._limit_firings(r, firings_r)
+            # Compute total cost
+            total_cost = 0
+            for r_idx, cost in rxn_costs:
+                total_cost += int(np.sum(n_firings[r_idx])) * cost
 
-            # Apply stoichiometry for this reaction
-            for s, delta in enumerate(self._stoichiometry[r, :]):
-                if delta != 0:
-                    self.lattice.counts[s, :, :] += delta * firings_r
+            if total_cost <= available:
+                # Enough resource — just decrement
+                self.global_resources[resource] = available - total_cost
+            else:
+                # Proportional limiting: scale down firings
+                ratio = available / total_cost if total_cost > 0 else 0.0
+
+                # Revert stoichiometry for affected reactions, then re-apply scaled
+                actual_cost = 0
+                for r_idx, cost in rxn_costs:
+                    old_firings = n_firings[r_idx].copy()
+                    new_firings = np.floor(old_firings * ratio).astype(np.int32)
+                    delta_firings = new_firings - old_firings  # negative
+
+                    for s, delta in enumerate(self._stoichiometry[r_idx, :]):
+                        if delta != 0:
+                            self.lattice.counts[s, :, :] += delta * delta_firings
+
+                    actual_cost += int(np.sum(new_firings)) * cost
+
+                self.global_resources[resource] = max(0, available - actual_cost)
 
     def _limit_firings(self, reaction_idx: int, firings: np.ndarray) -> np.ndarray:
         """
@@ -276,6 +429,8 @@ class MPDSolver(RDMESolver):
 
         for r, rxn in enumerate(self.reactions):
             propensities[r, :, :] = self._propensity_for_reaction(rxn)
+            # Apply site-type mask
+            propensities[r] *= self._reaction_masks[r]
 
         return propensities
 

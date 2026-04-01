@@ -1,0 +1,1 @@
+{"t_death": 1356.3000000000761, "death_mode": "cycle_collapse", "pnr_type": "rnap_deadlock", "t_pnr": 1326.150000000073, "dt_walking_dead": 30.150000000003047, "N_RNAP": 4, "N_Ribo": 17, "N_ATP": 1000, "seed": 65}
